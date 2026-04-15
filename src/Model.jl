@@ -21,6 +21,18 @@ struct Model{T <: Real, VT <: Real}
     unit_cell_volume::T
     recip_cell_volume::T
 
+    # Boundary conditions along each of the three lattice directions.
+    # Each entry is one of:
+    #     true                  -- fully periodic
+    #     :wavefunctions_only   -- wavefunctions periodic (plane-wave Bloch basis), but
+    #                              electrostatics treated as isolated via the truncated
+    #                              Coulomb method (Rozzi et al., Phys. Rev. B 73, 205119)
+    #     false                 -- fully isolated (reserved for future non-periodic-wavefunction
+    #                              implementations; currently acts like :wavefunctions_only for
+    #                              electrostatics)
+    # Isolated directions must be orthogonal to all periodic directions.
+    periodicity::NTuple{3, Union{Bool, Symbol}}
+
     # Computations can be performed at fixed `n_electrons` (`n_electrons` Int, `εF` nothing),
     # or fixed Fermi level (expert option, `n_electrons` nothing, `εF` T)
     n_electrons::Union{Int, Nothing}
@@ -142,6 +154,7 @@ function Model(lattice::AbstractMatrix{Tstatic},
                spin_polarization=determine_spin_polarization(magnetic_moments),
                symmetries=default_symmetries(lattice, atoms, positions, magnetic_moments,
                                              spin_polarization, terms),
+               periodicity=(true, true, true),
                ) where {Tstatic <: Real}
     # # a bit convoluted because kwargs can't determine type parameters
     T = promote_type(Tstatic, typeof(temperature))
@@ -179,6 +192,27 @@ function Model(lattice::AbstractMatrix{Tstatic},
     _is_well_conditioned(lattice[1:n_dim, 1:n_dim]) || @warn (
         "Your lattice is badly conditioned, the computation is likely to fail.")
 
+    # Validate and normalise the periodicity specification.
+    periodicity = NTuple{3, Union{Bool, Symbol}}(periodicity)
+    for p in periodicity
+        p === true || p === false || p === :wavefunctions_only || error(
+            "Each entry of `periodicity` must be `true`, `false`, or " *
+            "`:wavefunctions_only`, got $(repr(p)).")
+    end
+    # Isolated directions (anything other than `true`) must be orthogonal to every
+    # periodic direction so that the truncated Coulomb geometry is well-defined.
+    for i = 1:3, j = 1:3
+        i == j && continue
+        periodicity[i] === true && continue          # i is periodic — no constraint
+        periodicity[j] !== true && continue          # j also isolated — no constraint
+        if !iszero(dot(lattice[:, i], lattice[:, j]))
+            error("Periodicity check failed: lattice vector $i is marked " *
+                  "$(repr(periodicity[i])) but is not orthogonal to periodic " *
+                  "lattice vector $j. Isolated directions must be orthogonal " *
+                  "to all periodic ones.")
+        end
+    end
+
     # Note: In the 1D or 2D case, the volume is the length/surface
     inv_lattice       = compute_inverse_lattice(lattice)
     recip_lattice     = compute_recip_lattice(lattice)
@@ -213,7 +247,7 @@ function Model(lattice::AbstractMatrix{Tstatic},
 
     Model{T,value_type(T)}(model_name,
                            lattice, recip_lattice, n_dim, inv_lattice, inv_recip_lattice,
-                           unit_cell_volume, recip_cell_volume,
+                           unit_cell_volume, recip_cell_volume, periodicity,
                            n_electrons, εF, spin_polarization, n_spin, temperature, smearing,
                            atoms, positions, atom_groups, terms, symmetries)
 end
@@ -294,6 +328,7 @@ function Model{T}(model::Model;
           model.smearing,
           model.εF,
           model.spin_polarization,
+          model.periodicity,
           symmetries,
           # Can be safely disabled: this has been checked for model
           disable_electrostatics_check=true,
@@ -310,6 +345,31 @@ end
 
 Base.convert(::Type{Model{T}}, model::Model{T}) where {T}    = model
 Base.convert(::Type{Model{U}}, model::Model{T}) where {T, U} = Model{U}(model)
+
+"""
+Return `true` if wavefunctions are periodic along lattice direction `i` (i.e. standard
+Bloch plane-wave basis). Both `true` and `:wavefunctions_only` mean periodic wavefunctions.
+"""
+is_wavefunctions_periodic(p) = (p === true) || (p === :wavefunctions_only)
+is_wavefunctions_periodic(model::Model, i::Integer) =
+    is_wavefunctions_periodic(model.periodicity[i])
+
+"""
+Return `true` if the electrostatics (Hartree, local ionic, Ewald) are treated as periodic
+along lattice direction `i`. Only `true` yields periodic electrostatics; `:wavefunctions_only`
+and `false` both give isolated electrostatics via the truncated Coulomb method of
+Rozzi et al. (Phys. Rev. B 73, 205119 (2006)).
+"""
+is_electrostatics_periodic(p) = (p === true)
+is_electrostatics_periodic(model::Model, i::Integer) =
+    is_electrostatics_periodic(model.periodicity[i])
+
+"""Number of directions with periodic electrostatics (0 to 3)."""
+n_periodic_electrostatics(model::Model) =
+    count(is_electrostatics_periodic, model.periodicity)
+
+"""Return `true` if all three directions have periodic electrostatics (the default 3D case)."""
+is_fully_periodic_electrostatics(model::Model) = n_periodic_electrostatics(model) == 3
 
 normalize_magnetic_moment(::Nothing)::Vec3{Float64}          = (0, 0, 0)
 normalize_magnetic_moment(mm::Number)::Vec3{Float64}         = (0, 0, mm)
